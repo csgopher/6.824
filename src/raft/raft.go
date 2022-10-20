@@ -41,6 +41,7 @@ type ApplyMsg struct {
 	CommandValid bool
 	Command      interface{}
 	CommandIndex int
+	CommandTerm  int
 
 	// For 2D:
 	SnapshotValid bool
@@ -162,10 +163,35 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	//go rf.ticker()
 
 	go rf.leaderElection()
-	go rf.sendHeartbeat()
+	go rf.appendEntriesLoop()
+	go rf.applyLogLoop(applyCh)
 
 	//fmt.Printf("RaftNode[%d]启动\n", me)
 	return rf
+}
+
+func (rf *Raft) applyLogLoop(applyCh chan ApplyMsg) {
+	for !rf.killed() {
+		var appliedMsgs = make([]ApplyMsg, 0)
+		func() {
+			rf.mu.Lock()
+			defer rf.mu.Unlock()
+
+			for rf.commitIndex > rf.lastApplied {
+				rf.lastApplied += 1
+				appliedMsgs = append(appliedMsgs, ApplyMsg{
+					CommandValid: true,
+					Command:      rf.logs[rf.lastApplied-1].Command,
+					CommandIndex: rf.lastApplied,
+					CommandTerm:  rf.logs[rf.lastApplied-1].Term,
+				})
+				//fmt.Println()
+			}
+		}()
+		for _, msg := range appliedMsgs {
+			applyCh <- msg
+		}
+	}
 }
 
 func (rf *Raft) leaderElection() {
@@ -230,7 +256,7 @@ func (rf *Raft) kickoffElection() {
 					// 防止发多次日志
 					if isLead == false {
 						isLead = true
-						go rf.sendHeartbeat()
+						go rf.appendEntriesLoop()
 					}
 					//fmt.Printf("RaftNode[%d] RequestVote ends, voteCount[%d] Role[%d] currentTerm[%d]\n",
 					//	rf.me, voteCount, rf.state, rf.currentTerm)
@@ -240,7 +266,7 @@ func (rf *Raft) kickoffElection() {
 	}
 }
 
-func (rf *Raft) sendHeartbeat() {
+func (rf *Raft) appendEntriesLoop() {
 	for !rf.killed() {
 
 		func() {
@@ -257,32 +283,77 @@ func (rf *Raft) sendHeartbeat() {
 			}
 			rf.lastBroadcastTime = time.Now()
 
-			args := AppendEntriesArgs{
-				Term:     rf.currentTerm,
-				LeaderId: rf.me,
-			}
 			for i := 0; i < len(rf.peers); i++ {
 				if i != rf.me {
-					go func(p int) {
-						//fmt.Printf("RaftNode[%d] appendEntries starts, myTerm[%d] peerId[%d]\n",
-						//	rf.me, args.Term, p)
-						reply := AppendEntriesReply{}
-						ok := rf.sendAppendEntries(p, &args, &reply)
-						if !ok {
-							return
+					go func(id int) {
+						args := AppendEntriesArgs{
+							Term:         rf.currentTerm,
+							LeaderId:     rf.me,
+							PrevLogIndex: rf.nextIndex[id] - 1,
+							Entries:      rf.logs[rf.nextIndex[id]-1:],
+							LeaderCommit: rf.commitIndex,
 						}
-						rf.mu.Lock()
-						defer rf.mu.Unlock()
+						if args.PrevLogIndex >= 0 {
+							args.PrevLogTerm = rf.logs[args.PrevLogIndex].Term
+						}
+						//if args.PrevLogIndex > 0 {
+						//	args.PrevLogTerm = rf.logs[args.PrevLogIndex-1].Term
+						//}
 
-						if !reply.Success {
+						//fmt.Printf("RaftNode[%d] appendEntries starts, myTerm[%d] peerId[%d]\n",
+						//	rf.me, args.Term, id)
+
+						reply := AppendEntriesReply{}
+						if ok := rf.sendAppendEntries(id, &args, &reply); ok {
+							rf.mu.Lock()
+							defer rf.mu.Unlock()
+							defer func() {
+								//fmt.Printf("RaftNode[%d] appendEntries ends, peerTerm[%d] myCurrentTerm[%d] myRole[%d]\n",
+								//	rf.me, reply.Term, rf.currentTerm, rf.state)
+							}()
+
+							// 发送日志时，leader死了
+							//if rf.currentTerm != args.Term {
+							//	return
+							//}
+
 							if reply.Term > rf.currentTerm {
 								rf.state = Follower
 								rf.currentTerm = reply.Term
 								rf.votedFor = -1
+								//rf.persist()
+								return
+							}
+							if reply.Success {
+								rf.nextIndex[id] += len(args.Entries)
+								rf.matchIndex[id] = rf.nextIndex[id] - 1
+
+								commitCnt := 1
+								for i := 0; i < len(rf.peers); i++ {
+									if i == rf.me {
+										continue
+									}
+									if rf.matchIndex[i] >= rf.matchIndex[id] {
+										commitCnt++
+									}
+								}
+
+								if commitCnt >= len(rf.peers)/2+1 && rf.commitIndex < rf.matchIndex[id] &&
+									rf.logs[rf.matchIndex[id]].Term == rf.currentTerm {
+
+									rf.commitIndex = rf.matchIndex[id]
+
+								}
+
+							}
+
+						} else {
+							rf.nextIndex[id] -= 1
+							if rf.nextIndex[id] < 1 {
+								rf.nextIndex[id] = 1
 							}
 						}
-						//fmt.Printf("RaftNode[%d] appendEntries ends, peerTerm[%d] myCurrentTerm[%d] myRole[%d]\n",
-						//	rf.me, reply.Term, rf.currentTerm, rf.state)
+
 					}(i)
 				}
 			}
@@ -359,15 +430,45 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	//}()
 
 	rf.lastReceived = time.Now()
+
 	if args.Term < rf.currentTerm {
-		reply.Term = rf.currentTerm
-		reply.Success = false
 		return
 	}
-	if rf.state == Candidate {
-		rf.state = Follower
+
+	// 发现更大term，转为follower
+	if args.Term > rf.currentTerm {
 		rf.currentTerm = args.Term
+		rf.state = Follower
+		rf.votedFor = -1
+		//rf.persist()
 	}
+
+	if len(rf.logs) < args.PrevLogIndex {
+		return
+	}
+	if args.PrevLogIndex > 0 && rf.logs[args.PrevLogIndex-1].Term != args.PrevLogTerm {
+		return
+	}
+	for i, logEntry := range args.Entries {
+		index := args.PrevLogIndex + i + 1
+		if index > len(rf.logs) {
+			rf.logs = append(rf.logs, logEntry)
+		} else {
+			if rf.logs[index-1].Term != logEntry.Term {
+				rf.logs = rf.logs[:index-1]
+				rf.logs = append(rf.logs, logEntry)
+			}
+		}
+	}
+	//rf.persist()
+
+	if args.LeaderCommit > rf.commitIndex {
+		rf.commitIndex = args.LeaderCommit
+		if len(rf.logs) < rf.commitIndex {
+			rf.commitIndex = len(rf.logs)
+		}
+	}
+
 	reply.Success = true
 }
 
@@ -436,7 +537,7 @@ func (rf *Raft) CondInstallSnapshot(lastIncludedTerm int, lastIncludedIndex int,
 	return true
 }
 
-// the service says it has created a snapshot that has
+// Snapshot the service says it has created a snapshot that has
 // all info up to and including index. this means the
 // service no longer needs the log through (and including)
 // that index. Raft should now trim its log as much as possible.
@@ -445,7 +546,7 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 
 }
 
-// the service using Raft (e.g. a k/v server) wants to start
+// Start the service using Raft (e.g. a k/v server) wants to start
 // agreement on the next command to be appended to Raft's log. if this
 // server isn't the leader, returns false. otherwise start the
 // agreement and return immediately. there is no guarantee that this
@@ -463,11 +564,24 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	isLeader := true
 
 	// Your code here (2B).
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	if rf.state != Leader {
+		isLeader = false
+		return -1, -1, false
+	}
+	logEntry := LogEntry{
+		Command: command,
+		Term:    term,
+	}
+	rf.logs = append(rf.logs, &logEntry)
+	index = len(rf.logs)
+	term = rf.currentTerm
 
 	return index, term, isLeader
 }
 
-// the tester doesn't halt goroutines created by Raft after each test,
+// Kill the tester doesn't halt goroutines created by Raft after each test,
 // but it does call the Kill() method. your code can use killed() to
 // check whether Kill() has been called. the use of atomic avoids the
 // need for a lock.
@@ -476,7 +590,6 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 // up CPU time, perhaps causing later tests to fail and generating
 // confusing debug output. any goroutine with a long-running loop
 // should call killed() to check whether it should stop.
-
 func (rf *Raft) Kill() {
 	atomic.StoreInt32(&rf.dead, 1)
 	// Your code here, if desired.
