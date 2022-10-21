@@ -18,6 +18,7 @@ package raft
 //
 
 import (
+	"fmt"
 	"math/rand"
 	//	"bytes"
 	"sync"
@@ -125,7 +126,7 @@ type Raft struct {
 	lastBroadcastTime time.Time // leader上次的广播时间
 }
 
-// the service or tester wants to create a Raft server. the ports 服务或测试人员想要创建Raft服务器。
+// Make the service or tester wants to create a Raft server. the ports 服务或测试人员想要创建Raft服务器。
 // of all the Raft servers (including this one) are in peers[]. this// 所有Raft服务器（包括此服务器）中的端口位于对等服务器中[]。这
 // server's port is peers[me]. all the servers' peers[] arrays// 服务器的端口是peers[me]。所有服务器的对等[]阵列
 // have the same order. persister is a place for this server to// 有相同的顺序。persister是此服务器用来
@@ -134,7 +135,6 @@ type Raft struct {
 // tester or service expects Raft to send ApplyMsg messages.// 测试人员或服务人员希望Raft发送ApplyMsg消息。
 // Make() must return quickly, so it should start goroutines// Make（）必须快速返回，因此它应该启动goroutines
 // for any long-running work.// 对于任何长期运行的工作。
-
 func Make(peers []*labrpc.ClientEnd, me int,
 	persister *Persister, applyCh chan ApplyMsg) *Raft {
 	rf := &Raft{}
@@ -144,7 +144,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	// Your initialization code here (2A, 2B, 2C).
 	rf.votedFor = -1
-	//rf.logs = make([]LogEntry, 0)
+	rf.logs = make([]*LogEntry, 0)
 
 	rf.commitIndex = 0
 	rf.lastApplied = 0
@@ -166,7 +166,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	go rf.appendEntriesLoop()
 	go rf.applyLogLoop(applyCh)
 
-	//fmt.Printf("RaftNode[%d]启动\n", me)
+	fmt.Printf("RaftNode[%d]启动\n", me)
 	return rf
 }
 
@@ -202,67 +202,79 @@ func (rf *Raft) leaderElection() {
 		rf.mu.Lock()
 		// 在sleep一段时间后，lastReceived仍未更新（在startTime之前），说明未发送心跳，要开始选举。
 		if rf.lastReceived.Before(startTime) {
-			if rf.state != Leader {
-				go rf.kickoffElection()
+			if rf.state == Follower {
+				rf.lastReceived = time.Now()
+				rf.state = Candidate
+
+				fmt.Printf("RaftNode[%d] Follower -> Candidate\n", rf.me)
+
+				rf.currentTerm += 1
+				rf.votedFor = rf.me
+
+				args := RequestVoteArgs{
+					rf.currentTerm,
+					rf.me,
+					len(rf.logs),
+					0,
+				}
+
+				if len(rf.logs) != 0 {
+					args.LastLogTerm = rf.logs[len(rf.logs)-1].Term
+				}
+
+				voteCount := 1
+				isLeader := false
+				for i := 0; i < len(rf.peers); i++ {
+					if i != rf.me {
+						go func(p int) {
+							reply := RequestVoteReply{}
+							fmt.Printf("RaftNode[%d] RequestVote starts, "+
+								"Term[%d] LastLogIndex[%d] LastLogTerm[%d] 向[%d]要票\n",
+								rf.me, args.Term, args.LastLogIndex, args.LastLogTerm, p)
+
+							ok := rf.sendRequestVote(p, &args, &reply)
+							if !ok {
+								return
+							}
+
+							fmt.Printf("RaftNode[%d] RequestVoting 正在进行！ "+
+								"Term[%d] LastLogIndex[%d] LastLogTerm[%d] 向[%d]要票 reply.Term[%d]\n",
+								rf.me, args.Term, args.LastLogIndex, args.LastLogTerm, p, reply.Term)
+
+							rf.mu.Lock()
+							defer rf.mu.Unlock()
+							if !reply.VoteGranted {
+								if reply.Term > rf.currentTerm {
+									rf.currentTerm = reply.Term
+									rf.state = Follower
+								}
+								return
+							}
+							// 获得选票
+							voteCount++
+							if voteCount > len(rf.peers)/2 {
+								rf.state = Leader
+								for i := 0; i < len(rf.peers); i++ {
+									rf.nextIndex[i] = len(rf.logs) + 1
+								}
+								for i := 0; i < len(rf.peers); i++ {
+									rf.matchIndex[i] = 0
+								}
+								// 防止发多次日志
+								if isLeader == false {
+									isLeader = true
+									go rf.appendEntriesLoop()
+								}
+								fmt.Printf("RaftNode[%d] RequestVote ends, voteCount[%d] Role[%d] currentTerm[%d]\n",
+									rf.me, voteCount, rf.state, rf.currentTerm)
+							}
+						}(i)
+					}
+				}
+
 			}
 		}
 		rf.mu.Unlock()
-	}
-}
-
-func (rf *Raft) kickoffElection() {
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
-	rf.lastReceived = time.Now()
-	rf.state = Candidate
-
-	//fmt.Printf("RaftNode[%d] Follower -> Candidate\n", rf.me)
-
-	rf.currentTerm += 1
-	rf.votedFor = rf.me
-
-	args := RequestVoteArgs{
-		rf.currentTerm,
-		rf.me,
-		len(rf.logs),
-		0,
-	}
-
-	//fmt.Printf("RaftNode[%d] RequestVote starts, Term[%d] LastLogIndex[%d] LastLogTerm[%d]\n", rf.me, args.Term,
-	//	args.LastLogIndex, args.LastLogTerm)
-	voteCount := 1
-	isLead := false
-	for i := 0; i < len(rf.peers); i++ {
-		if i != rf.me {
-			go func(p int) {
-				reply := RequestVoteReply{}
-				ok := rf.sendRequestVote(p, &args, &reply)
-				if !ok {
-					return
-				}
-				rf.mu.Lock()
-				defer rf.mu.Unlock()
-				if !reply.VoteGranted {
-					if reply.Term > rf.currentTerm {
-						rf.currentTerm = reply.Term
-						rf.state = Follower
-					}
-					return
-				}
-				// 获得选票
-				voteCount++
-				if voteCount > len(rf.peers)/2 {
-					rf.state = Leader
-					// 防止发多次日志
-					if isLead == false {
-						isLead = true
-						go rf.appendEntriesLoop()
-					}
-					//fmt.Printf("RaftNode[%d] RequestVote ends, voteCount[%d] Role[%d] currentTerm[%d]\n",
-					//	rf.me, voteCount, rf.state, rf.currentTerm)
-				}
-			}(i)
-		}
 	}
 }
 
@@ -286,6 +298,7 @@ func (rf *Raft) appendEntriesLoop() {
 			for i := 0; i < len(rf.peers); i++ {
 				if i != rf.me {
 					go func(id int) {
+						rf.mu.Lock()
 						args := AppendEntriesArgs{
 							Term:         rf.currentTerm,
 							LeaderId:     rf.me,
@@ -293,23 +306,29 @@ func (rf *Raft) appendEntriesLoop() {
 							Entries:      rf.logs[rf.nextIndex[id]-1:],
 							LeaderCommit: rf.commitIndex,
 						}
-						if args.PrevLogIndex >= 0 {
-							args.PrevLogTerm = rf.logs[args.PrevLogIndex].Term
-						}
-						//if args.PrevLogIndex > 0 {
-						//	args.PrevLogTerm = rf.logs[args.PrevLogIndex-1].Term
+						//if args.PrevLogIndex >= 0 {
+						//	args.PrevLogTerm = rf.logs[args.PrevLogIndex].Term
 						//}
+						if args.PrevLogIndex > 0 {
+							args.PrevLogTerm = rf.logs[args.PrevLogIndex-1].Term
+						}
+						rf.mu.Unlock()
 
-						//fmt.Printf("RaftNode[%d] appendEntries starts, myTerm[%d] peerId[%d]\n",
-						//	rf.me, args.Term, id)
+						fmt.Printf("RaftNode[%d] appendEntries starts, myTerm[%d] send log to[%d] state[%d]\n",
+							rf.me, args.Term, id, rf.state)
+
+						if rf.state != Leader {
+							return
+						}
 
 						reply := AppendEntriesReply{}
 						if ok := rf.sendAppendEntries(id, &args, &reply); ok {
 							rf.mu.Lock()
 							defer rf.mu.Unlock()
+
 							defer func() {
-								//fmt.Printf("RaftNode[%d] appendEntries ends, peerTerm[%d] myCurrentTerm[%d] myRole[%d]\n",
-								//	rf.me, reply.Term, rf.currentTerm, rf.state)
+								fmt.Printf("RaftNode[%d] appendEntries ends, peerTerm[%d] myCurrentTerm[%d] myRole[%d]\n",
+									rf.me, reply.Term, rf.currentTerm, rf.state)
 							}()
 
 							// 发送日志时，leader死了
@@ -340,20 +359,16 @@ func (rf *Raft) appendEntriesLoop() {
 
 								if commitCnt >= len(rf.peers)/2+1 && rf.commitIndex < rf.matchIndex[id] &&
 									rf.logs[rf.matchIndex[id]].Term == rf.currentTerm {
-
 									rf.commitIndex = rf.matchIndex[id]
-
 								}
 
-							}
-
-						} else {
-							rf.nextIndex[id] -= 1
-							if rf.nextIndex[id] < 1 {
-								rf.nextIndex[id] = 1
+							} else {
+								rf.nextIndex[id] -= 1
+								if rf.nextIndex[id] < 1 {
+									rf.nextIndex[id] = 1
+								}
 							}
 						}
-
 					}(i)
 				}
 			}
@@ -362,10 +377,9 @@ func (rf *Raft) appendEntriesLoop() {
 	}
 }
 
-// return currentTerm and whether this server
+// GetState return currentTerm and whether this server
 // believes it is the leader.
 // 返回当前任期以及此server是否相信这是领导者。
-
 func (rf *Raft) GetState() (int, bool) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
@@ -386,11 +400,13 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
-	//fmt.Printf("RaftNode[%d] Handle RequestVote, CandidatesId[%d] Term[%d] CurrentTerm[%d] LastLogIndex[%d] LastLogTerm[%d] votedFor[%d]\n",
-	//	rf.me, args.CandidateId, args.Term, rf.currentTerm, args.LastLogIndex, args.LastLogTerm, rf.votedFor)
-	//defer func() {
-	//	fmt.Printf("RaftNode[%d] Return RequestVote, CandidatesId[%d] VoteGranted[%v] \n", rf.me, args.CandidateId, reply.VoteGranted)
-	//}()
+	rf.votedFor = -1
+
+	fmt.Printf("RaftNode[%d] Handle RequestVote, CandidatesId[%d] Term[%d] CurrentTerm[%d] LastLogIndex[%d] LastLogTerm[%d] votedFor[%d]\n",
+		rf.me, args.CandidateId, args.Term, rf.currentTerm, args.LastLogIndex, args.LastLogTerm, rf.votedFor)
+	defer func() {
+		fmt.Printf("RaftNode[%d] Return RequestVote, CandidatesId[%d] VoteGranted[%v] \n", rf.me, args.CandidateId, reply.VoteGranted)
+	}()
 
 	// reply false if term < currentTerm
 	if args.Term < rf.currentTerm {
@@ -408,26 +424,40 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	}
 
 	if rf.votedFor == -1 || rf.votedFor == args.CandidateId {
+		// candidate的日志必须比我的新
+		// 1 日志长度相同，最后一条日志term大，更新
+		// 2 更长的日志，更新
+		lastLogTerm := 0
+		if len(rf.logs) != 0 {
+			lastLogTerm = rf.logs[len(rf.logs)-1].Term
+		}
+		if args.LastLogTerm < lastLogTerm || args.LastLogIndex < len(rf.logs) {
+			return
+		}
 		rf.votedFor = args.CandidateId
 		reply.VoteGranted = true
 		rf.lastReceived = time.Now()
 	}
-
+	//rf.persist()
 }
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
+	fmt.Printf("RaftNode[%d] Handle AppendEntries还未拿到锁！, "+
+		"LeaderId[%d] Term[%d] CurrentTerm[%d] role=[%d]\n",
+		rf.me, args.LeaderId, args.Term, rf.currentTerm, rf.state)
+
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
 	reply.Term = rf.currentTerm
 	reply.Success = false
 
-	//fmt.Printf("RaftNode[%d] Handle AppendEntries, LeaderId[%d] Term[%d] CurrentTerm[%d] role=[%d]\n",
-	//	rf.me, args.LeaderId, args.Term, rf.currentTerm, rf.state)
-	//defer func() {
-	//	fmt.Printf("RaftNode[%d] Return AppendEntries, LeaderId[%d] Term[%d] CurrentTerm[%d] role=[%d]\n",
-	//		rf.me, args.LeaderId, args.Term, rf.currentTerm, rf.state)
-	//}()
+	fmt.Printf("RaftNode[%d] Handle AppendEntries, LeaderId[%d] Term[%d] CurrentTerm[%d] role=[%d]\n",
+		rf.me, args.LeaderId, args.Term, rf.currentTerm, rf.state)
+	defer func() {
+		fmt.Printf("RaftNode[%d] Return AppendEntries, LeaderId[%d] Term[%d] CurrentTerm[%d] role=[%d]\n",
+			rf.me, args.LeaderId, args.Term, rf.currentTerm, rf.state)
+	}()
 
 	rf.lastReceived = time.Now()
 
