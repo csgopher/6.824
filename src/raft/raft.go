@@ -18,8 +18,9 @@ package raft
 //
 
 import (
-	"fmt"
 	"math/rand"
+	"sort"
+
 	//	"bytes"
 	"sync"
 	"sync/atomic"
@@ -114,8 +115,8 @@ type Raft struct {
 	logs        []*LogEntry
 
 	// 所有servers的可不持久化变量
-	commitIndex int // 状态机中已知的被提交的日志条目的索引值(初始化为0，持续递增）
-	lastApplied int // 最后一个被追加到状态机日志的索引值
+	commitIndex int // 状态机中已知的被提交的日志条目的索引值(初始化为-1，持续递增）
+	lastApplied int // 最后一个被追加到状态机日志的索引值 初始化为-1
 
 	// leader的可不持久化变量
 	nextIndex  []int // 对于每一个server，需要发送给他下一个日志条目的索引值（初始化为leader日志index+1,那么范围就对标len）
@@ -146,8 +147,8 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.votedFor = -1
 	rf.logs = make([]*LogEntry, 0)
 
-	rf.commitIndex = 0
-	rf.lastApplied = 0
+	rf.commitIndex = -1
+	rf.lastApplied = -1
 
 	rf.nextIndex = make([]int, len(peers))
 	rf.matchIndex = make([]int, len(peers))
@@ -166,29 +167,30 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	go rf.appendEntriesLoop()
 	go rf.applyLogLoop(applyCh)
 
-	fmt.Printf("RaftNode[%d]启动\n", me)
+	DPrintf("RaftNode[%d]启动\n", me)
 	return rf
 }
 
 func (rf *Raft) applyLogLoop(applyCh chan ApplyMsg) {
 	for !rf.killed() {
-		var appliedMsgs = make([]ApplyMsg, 0)
+		var appliedMsg = make([]ApplyMsg, 0)
 		func() {
 			rf.mu.Lock()
 			defer rf.mu.Unlock()
 
 			for rf.commitIndex > rf.lastApplied {
 				rf.lastApplied += 1
-				appliedMsgs = append(appliedMsgs, ApplyMsg{
+				DPrintf("apply a Log, rf.lastApplied=[%d]", rf.lastApplied)
+				appliedMsg = append(appliedMsg, ApplyMsg{
 					CommandValid: true,
-					Command:      rf.logs[rf.lastApplied-1].Command,
+					Command:      rf.logs[rf.lastApplied].Command,
 					CommandIndex: rf.lastApplied,
-					CommandTerm:  rf.logs[rf.lastApplied-1].Term,
+					CommandTerm:  rf.logs[rf.lastApplied].Term,
 				})
-				//fmt.Println()
+
 			}
 		}()
-		for _, msg := range appliedMsgs {
+		for _, msg := range appliedMsg {
 			applyCh <- msg
 		}
 	}
@@ -202,11 +204,15 @@ func (rf *Raft) leaderElection() {
 		rf.mu.Lock()
 		// 在sleep一段时间后，lastReceived仍未更新（在startTime之前），说明未发送心跳，要开始选举。
 		if rf.lastReceived.Before(startTime) {
-			if rf.state == Follower {
+
+			// debug找出来的问题2，这样写导致，经过一轮选举没有选出leader，就无法再进行下轮选举
+			//if rf.state == Follower {
+			if rf.state != Leader {
+
 				rf.lastReceived = time.Now()
 				rf.state = Candidate
 
-				fmt.Printf("RaftNode[%d] Follower -> Candidate\n", rf.me)
+				DPrintf("RaftNode[%d] Follower -> Candidate\n", rf.me)
 
 				rf.currentTerm += 1
 				rf.votedFor = rf.me
@@ -228,18 +234,20 @@ func (rf *Raft) leaderElection() {
 					if i != rf.me {
 						go func(p int) {
 							reply := RequestVoteReply{}
-							fmt.Printf("RaftNode[%d] RequestVote starts, "+
+							DPrintf("RaftNode[%d] RequestVote starts, "+
 								"Term[%d] LastLogIndex[%d] LastLogTerm[%d] 向[%d]要票\n",
 								rf.me, args.Term, args.LastLogIndex, args.LastLogTerm, p)
 
 							ok := rf.sendRequestVote(p, &args, &reply)
 							if !ok {
+								DPrintf("RaftNode[%d] RequestVote [%d]no reply ! Term[%d] voteCnt[%d]\n",
+									rf.me, p, args.Term, voteCount)
 								return
 							}
 
-							fmt.Printf("RaftNode[%d] RequestVoting 正在进行！ "+
-								"Term[%d] LastLogIndex[%d] LastLogTerm[%d] 向[%d]要票 reply.Term[%d]\n",
-								rf.me, args.Term, args.LastLogIndex, args.LastLogTerm, p, reply.Term)
+							//DPrintf("RaftNode[%d] RequestVoting 正在进行！ "+
+							//	"Term[%d] LastLogIndex[%d] LastLogTerm[%d] 取得[%d]的票 reply.Term[%d]\n",
+							//	rf.me, args.Term, args.LastLogIndex, args.LastLogTerm, p, reply.Term)
 
 							rf.mu.Lock()
 							defer rf.mu.Unlock()
@@ -255,7 +263,7 @@ func (rf *Raft) leaderElection() {
 							if voteCount > len(rf.peers)/2 {
 								rf.state = Leader
 								for i := 0; i < len(rf.peers); i++ {
-									rf.nextIndex[i] = len(rf.logs) + 1
+									rf.nextIndex[i] = len(rf.logs)
 								}
 								for i := 0; i < len(rf.peers); i++ {
 									rf.matchIndex[i] = 0
@@ -265,7 +273,7 @@ func (rf *Raft) leaderElection() {
 									isLeader = true
 									go rf.appendEntriesLoop()
 								}
-								fmt.Printf("RaftNode[%d] RequestVote ends, voteCount[%d] Role[%d] currentTerm[%d]\n",
+								DPrintf("RaftNode[%d] RequestVote ends, voteCount[%d] Role[%d] currentTerm[%d]\n",
 									rf.me, voteCount, rf.state, rf.currentTerm)
 							}
 						}(i)
@@ -303,19 +311,18 @@ func (rf *Raft) appendEntriesLoop() {
 							Term:         rf.currentTerm,
 							LeaderId:     rf.me,
 							PrevLogIndex: rf.nextIndex[id] - 1,
-							Entries:      rf.logs[rf.nextIndex[id]-1:],
+							Entries:      make([]*LogEntry, 0),
 							LeaderCommit: rf.commitIndex,
 						}
-						//if args.PrevLogIndex >= 0 {
-						//	args.PrevLogTerm = rf.logs[args.PrevLogIndex].Term
-						//}
-						if args.PrevLogIndex > 0 {
-							args.PrevLogTerm = rf.logs[args.PrevLogIndex-1].Term
+						args.Entries = append(args.Entries, rf.logs[rf.nextIndex[id]:]...)
+						if args.PrevLogIndex >= 0 {
+							//fmt.Printf("%d %d\n",args.PrevLogIndex,len(rf.logs))
+							args.PrevLogTerm = rf.logs[args.PrevLogIndex].Term
 						}
 						rf.mu.Unlock()
 
-						fmt.Printf("RaftNode[%d] appendEntries starts, myTerm[%d] send log to[%d] state[%d]\n",
-							rf.me, args.Term, id, rf.state)
+						DPrintf("RaftNode[%d] appendEntries starts,  currentTerm[%d] sendLogTo[%d]  nextIndex[%d] matchIndex[%d] args.Entries[%d] commitIndex[%d]",
+							rf.me, rf.currentTerm, id, rf.nextIndex[id], rf.matchIndex[id], len(args.Entries), rf.commitIndex)
 
 						if rf.state != Leader {
 							return
@@ -327,8 +334,8 @@ func (rf *Raft) appendEntriesLoop() {
 							defer rf.mu.Unlock()
 
 							defer func() {
-								fmt.Printf("RaftNode[%d] appendEntries ends, peerTerm[%d] myCurrentTerm[%d] myRole[%d]\n",
-									rf.me, reply.Term, rf.currentTerm, rf.state)
+								DPrintf("RaftNode[%d] appendEntries ends, currentTerm[%d]  peer[%d] nextIndex[%d] matchIndex[%d] commitIndex[%d]",
+									rf.me, rf.currentTerm, id, rf.nextIndex[id], rf.matchIndex[id], rf.commitIndex)
 							}()
 
 							// 发送日志时，leader死了
@@ -344,30 +351,41 @@ func (rf *Raft) appendEntriesLoop() {
 								return
 							}
 							if reply.Success {
+								if len(args.Entries) == 0 {
+									return
+								}
 								rf.nextIndex[id] += len(args.Entries)
 								rf.matchIndex[id] = rf.nextIndex[id] - 1
 
-								commitCnt := 1
+								sortedMatchIndex := make([]int, 0)
+								sortedMatchIndex = append(sortedMatchIndex, len(rf.logs))
 								for i := 0; i < len(rf.peers); i++ {
 									if i == rf.me {
 										continue
 									}
-									if rf.matchIndex[i] >= rf.matchIndex[id] {
-										commitCnt++
-									}
+									sortedMatchIndex = append(sortedMatchIndex, rf.matchIndex[i])
 								}
+								sort.Ints(sortedMatchIndex)
+								newCommitIndex := sortedMatchIndex[len(rf.peers)/2]
+								DPrintf("RaftNode[%d] before updateCommitIndex, newCommitIndex[%d] matchIndex[%v]"+
+									" rf.logs[newCommitIndex].Term[%d] rf.currentTerm[%d]",
+									rf.me, newCommitIndex, sortedMatchIndex, rf.logs[newCommitIndex].Term, rf.currentTerm)
 
-								if commitCnt >= len(rf.peers)/2+1 && rf.commitIndex < rf.matchIndex[id] &&
-									rf.logs[rf.matchIndex[id]].Term == rf.currentTerm {
-									rf.commitIndex = rf.matchIndex[id]
+								if newCommitIndex > rf.commitIndex && rf.logs[newCommitIndex].Term == rf.currentTerm {
+									rf.commitIndex = newCommitIndex
 								}
+								DPrintf("RaftNode[%d] updateCommitIndex, commitIndex[%d] matchIndex[%v]",
+									rf.me, rf.commitIndex, sortedMatchIndex)
 
 							} else {
 								rf.nextIndex[id] -= 1
-								if rf.nextIndex[id] < 1 {
-									rf.nextIndex[id] = 1
+								if rf.nextIndex[id] < 0 {
+									rf.nextIndex[id] = 0
 								}
 							}
+						} else {
+							DPrintf("RaftNode[%d] appendEntries send fail ! rf.killed()=[%v]\n",
+								rf.me, rf.killed())
 						}
 					}(i)
 				}
@@ -400,12 +418,10 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
-	rf.votedFor = -1
-
-	fmt.Printf("RaftNode[%d] Handle RequestVote, CandidatesId[%d] Term[%d] CurrentTerm[%d] LastLogIndex[%d] LastLogTerm[%d] votedFor[%d]\n",
+	DPrintf("RaftNode[%d] Handle RequestVote, CandidatesId[%d] Term[%d] CurrentTerm[%d] LastLogIndex[%d] LastLogTerm[%d] votedFor[%d]\n",
 		rf.me, args.CandidateId, args.Term, rf.currentTerm, args.LastLogIndex, args.LastLogTerm, rf.votedFor)
 	defer func() {
-		fmt.Printf("RaftNode[%d] Return RequestVote, CandidatesId[%d] VoteGranted[%v] \n", rf.me, args.CandidateId, reply.VoteGranted)
+		DPrintf("RaftNode[%d] Return RequestVote, CandidatesId[%d] VoteGranted[%v] \n", rf.me, args.CandidateId, reply.VoteGranted)
 	}()
 
 	// reply false if term < currentTerm
@@ -442,9 +458,9 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 }
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
-	fmt.Printf("RaftNode[%d] Handle AppendEntries还未拿到锁！, "+
-		"LeaderId[%d] Term[%d] CurrentTerm[%d] role=[%d]\n",
-		rf.me, args.LeaderId, args.Term, rf.currentTerm, rf.state)
+	//DPrintf("RaftNode[%d] Handle AppendEntries enter func() ! "+
+	//	"LeaderId[%d] Term[%d] CurrentTerm[%d] role=[%d]\n",
+	//	rf.me, args.LeaderId, args.Term, rf.currentTerm, rf.state)
 
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
@@ -452,11 +468,12 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	reply.Term = rf.currentTerm
 	reply.Success = false
 
-	fmt.Printf("RaftNode[%d] Handle AppendEntries, LeaderId[%d] Term[%d] CurrentTerm[%d] role=[%d]\n",
-		rf.me, args.LeaderId, args.Term, rf.currentTerm, rf.state)
+	DPrintf("RaftNode[%d] Handle AppendEntries, LeaderId[%d] Term[%d] CurrentTerm[%d] role=[%v]  prevLogIndex[%d] prevLogTerm[%d] commitIndex[%d] Entries[%v]",
+		rf.me, args.LeaderId, args.Term, rf.currentTerm, rf.state, args.PrevLogIndex, args.PrevLogTerm, rf.commitIndex, args.Entries)
+
 	defer func() {
-		fmt.Printf("RaftNode[%d] Return AppendEntries, LeaderId[%d] Term[%d] CurrentTerm[%d] role=[%d]\n",
-			rf.me, args.LeaderId, args.Term, rf.currentTerm, rf.state)
+		DPrintf("RaftNode[%d] Return AppendEntries, LeaderId[%d] Term[%d] CurrentTerm[%d] role=[%d] prevLogIndex[%d] prevLogTerm[%d] Success[%v] commitIndex[%d] log[%v]",
+			rf.me, args.LeaderId, args.Term, rf.currentTerm, rf.state, args.PrevLogIndex, args.PrevLogTerm, reply.Success, rf.commitIndex, len(rf.logs))
 	}()
 
 	rf.lastReceived = time.Now()
@@ -473,15 +490,18 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		//rf.persist()
 	}
 
+	// follower日志长度小于leader，返回false
 	if len(rf.logs) < args.PrevLogIndex {
 		return
 	}
-	if args.PrevLogIndex > 0 && rf.logs[args.PrevLogIndex-1].Term != args.PrevLogTerm {
+	// follower和leader的日志在相同PrevLogIndex下的Term不同，返回false
+	if args.PrevLogIndex > -1 && rf.logs[args.PrevLogIndex].Term != args.PrevLogTerm {
 		return
 	}
 	for i, logEntry := range args.Entries {
-		index := args.PrevLogIndex + i + 1
-		if index > len(rf.logs) {
+		index := args.PrevLogIndex + 1 + i
+		if index > len(rf.logs)-1 {
+			// 超出部分追加
 			rf.logs = append(rf.logs, logEntry)
 		} else {
 			if rf.logs[index-1].Term != logEntry.Term {
@@ -600,14 +620,16 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		isLeader = false
 		return -1, -1, false
 	}
+
+	term = rf.currentTerm
 	logEntry := LogEntry{
 		Command: command,
 		Term:    term,
 	}
 	rf.logs = append(rf.logs, &logEntry)
-	index = len(rf.logs)
-	term = rf.currentTerm
+	index = len(rf.logs) - 1
 
+	DPrintf("RaftNode[%d] Add Command, logIndex[%d] currentTerm[%d]", rf.me, index, term)
 	return index, term, isLeader
 }
 
@@ -618,7 +640,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 //
 // the issue is that long-running goroutines use memory and may chew
 // up CPU time, perhaps causing later tests to fail and generating
-// confusing debug output. any goroutine with a long-running loop
+// confusing output. any goroutine with a long-running loop
 // should call killed() to check whether it should stop.
 func (rf *Raft) Kill() {
 	atomic.StoreInt32(&rf.dead, 1)
