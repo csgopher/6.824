@@ -115,8 +115,8 @@ type Raft struct {
 	logs        []*LogEntry
 
 	// 所有servers的可不持久化变量
-	commitIndex int // 状态机中已知的被提交的日志条目的索引值(初始化为-1，持续递增）
-	lastApplied int // 最后一个被追加到状态机日志的索引值 初始化为-1
+	commitIndex int // 状态机中已知的被提交的日志条目的索引值(初始化为0，持续递增）
+	lastApplied int // 最后一个被追加到状态机日志的索引值 初始化为0
 
 	// leader的可不持久化变量
 	nextIndex  []int // 对于每一个server，需要发送给他下一个日志条目的索引值（初始化为leader日志index+1,那么范围就对标len）
@@ -147,8 +147,8 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.votedFor = -1
 	rf.logs = make([]*LogEntry, 0)
 
-	rf.commitIndex = -1
-	rf.lastApplied = -1
+	rf.commitIndex = 0
+	rf.lastApplied = 0
 
 	rf.nextIndex = make([]int, len(peers))
 	rf.matchIndex = make([]int, len(peers))
@@ -183,9 +183,9 @@ func (rf *Raft) applyLogLoop(applyCh chan ApplyMsg) {
 				DPrintf("apply a Log, rf.lastApplied=[%d]", rf.lastApplied)
 				appliedMsg = append(appliedMsg, ApplyMsg{
 					CommandValid: true,
-					Command:      rf.logs[rf.lastApplied].Command,
+					Command:      rf.logs[rf.lastApplied-1].Command,
 					CommandIndex: rf.lastApplied,
-					CommandTerm:  rf.logs[rf.lastApplied].Term,
+					CommandTerm:  rf.logs[rf.lastApplied-1].Term,
 				})
 
 			}
@@ -263,7 +263,7 @@ func (rf *Raft) leaderElection() {
 							if voteCount > len(rf.peers)/2 {
 								rf.state = Leader
 								for i := 0; i < len(rf.peers); i++ {
-									rf.nextIndex[i] = len(rf.logs)
+									rf.nextIndex[i] = len(rf.logs) + 1
 								}
 								for i := 0; i < len(rf.peers); i++ {
 									rf.matchIndex[i] = 0
@@ -314,10 +314,14 @@ func (rf *Raft) appendEntriesLoop() {
 							Entries:      make([]*LogEntry, 0),
 							LeaderCommit: rf.commitIndex,
 						}
-						args.Entries = append(args.Entries, rf.logs[rf.nextIndex[id]:]...)
-						if args.PrevLogIndex >= 0 {
+
+						DPrintf("RaftNode[%d] 初始化AppendEntriesArgs,  currentTerm[%d] sendLogTo[%d]  nextIndex[%d] matchIndex[%d] args.Entries[%d] commitIndex[%d] rf.logs.len[%v]",
+							rf.me, rf.currentTerm, id, rf.nextIndex[id], rf.matchIndex[id], len(args.Entries), rf.commitIndex, len(rf.logs))
+
+						args.Entries = append(args.Entries, rf.logs[rf.nextIndex[id]-1:]...)
+						if args.PrevLogIndex > 0 {
 							//fmt.Printf("%d %d\n",args.PrevLogIndex,len(rf.logs))
-							args.PrevLogTerm = rf.logs[args.PrevLogIndex].Term
+							args.PrevLogTerm = rf.logs[args.PrevLogIndex-1].Term
 						}
 						rf.mu.Unlock()
 
@@ -358,7 +362,7 @@ func (rf *Raft) appendEntriesLoop() {
 								rf.matchIndex[id] = rf.nextIndex[id] - 1
 
 								sortedMatchIndex := make([]int, 0)
-								sortedMatchIndex = append(sortedMatchIndex, len(rf.logs))
+								sortedMatchIndex = append(sortedMatchIndex, len(rf.logs)) // 加上自己（leader）
 								for i := 0; i < len(rf.peers); i++ {
 									if i == rf.me {
 										continue
@@ -368,10 +372,11 @@ func (rf *Raft) appendEntriesLoop() {
 								sort.Ints(sortedMatchIndex)
 								newCommitIndex := sortedMatchIndex[len(rf.peers)/2]
 								DPrintf("RaftNode[%d] before updateCommitIndex, newCommitIndex[%d] matchIndex[%v]"+
-									" rf.logs[newCommitIndex].Term[%d] rf.currentTerm[%d]",
-									rf.me, newCommitIndex, sortedMatchIndex, rf.logs[newCommitIndex].Term, rf.currentTerm)
+									" rf.logs[%v] rf.currentTerm[%d]",
+									rf.me, newCommitIndex, sortedMatchIndex, rf.logs, rf.currentTerm)
 
-								if newCommitIndex > rf.commitIndex && rf.logs[newCommitIndex].Term == rf.currentTerm {
+								// figure8
+								if newCommitIndex > rf.commitIndex && rf.logs[newCommitIndex-1].Term == rf.currentTerm {
 									rf.commitIndex = newCommitIndex
 								}
 								DPrintf("RaftNode[%d] updateCommitIndex, commitIndex[%d] matchIndex[%v]",
@@ -379,8 +384,8 @@ func (rf *Raft) appendEntriesLoop() {
 
 							} else {
 								rf.nextIndex[id] -= 1
-								if rf.nextIndex[id] < 0 {
-									rf.nextIndex[id] = 0
+								if rf.nextIndex[id] < 1 {
+									rf.nextIndex[id] = 1
 								}
 							}
 						} else {
@@ -495,17 +500,17 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		return
 	}
 	// follower和leader的日志在相同PrevLogIndex下的Term不同，返回false
-	if args.PrevLogIndex > -1 && rf.logs[args.PrevLogIndex].Term != args.PrevLogTerm {
+	if args.PrevLogIndex > 0 && rf.logs[args.PrevLogIndex-1].Term != args.PrevLogTerm {
 		return
 	}
 	for i, logEntry := range args.Entries {
-		index := args.PrevLogIndex + 1 + i
+		index := args.PrevLogIndex + i
 		if index > len(rf.logs)-1 {
 			// 超出部分追加
 			rf.logs = append(rf.logs, logEntry)
 		} else {
-			if rf.logs[index-1].Term != logEntry.Term {
-				rf.logs = rf.logs[:index-1]
+			if rf.logs[index].Term != logEntry.Term {
+				rf.logs = rf.logs[:index]
 				rf.logs = append(rf.logs, logEntry)
 			}
 		}
@@ -627,7 +632,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		Term:    term,
 	}
 	rf.logs = append(rf.logs, &logEntry)
-	index = len(rf.logs) - 1
+	index = len(rf.logs)
 
 	DPrintf("RaftNode[%d] Add Command, logIndex[%d] currentTerm[%d]", rf.me, index, term)
 	return index, term, isLeader
