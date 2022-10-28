@@ -18,6 +18,9 @@ package raft
 //
 
 import (
+	"6.824/labgob"
+	"bytes"
+	"encoding/gob"
 	"math/rand"
 	"sort"
 
@@ -216,6 +219,7 @@ func (rf *Raft) leaderElection() {
 
 				rf.currentTerm += 1
 				rf.votedFor = rf.me
+				rf.persist()
 
 				args := RequestVoteArgs{
 					rf.currentTerm,
@@ -255,6 +259,7 @@ func (rf *Raft) leaderElection() {
 								if reply.Term > rf.currentTerm {
 									rf.currentTerm = reply.Term
 									rf.state = Follower
+									rf.persist()
 								}
 								return
 							}
@@ -318,7 +323,7 @@ func (rf *Raft) appendEntriesLoop() {
 						DPrintf("RaftNode[%d] 初始化AppendEntriesArgs,  currentTerm[%d] sendLogTo[%d]  nextIndex[%d] matchIndex[%d] args.Entries[%d] commitIndex[%d] rf.logs.len[%v]",
 							rf.me, rf.currentTerm, id, rf.nextIndex[id], rf.matchIndex[id], len(args.Entries), rf.commitIndex, len(rf.logs))
 
-						args.Entries = append(args.Entries, rf.logs[rf.nextIndex[id]-1:]...)
+						args.Entries = append(args.Entries, rf.logs[args.PrevLogIndex:]...)
 						if args.PrevLogIndex > 0 {
 							//fmt.Printf("%d %d\n",args.PrevLogIndex,len(rf.logs))
 							args.PrevLogTerm = rf.logs[args.PrevLogIndex-1].Term
@@ -351,7 +356,7 @@ func (rf *Raft) appendEntriesLoop() {
 								rf.state = Follower
 								rf.currentTerm = reply.Term
 								rf.votedFor = -1
-								//rf.persist()
+								rf.persist()
 								return
 							}
 							if reply.Success {
@@ -459,7 +464,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		reply.VoteGranted = true
 		rf.lastReceived = time.Now()
 	}
-	//rf.persist()
+	rf.persist()
 }
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
@@ -492,7 +497,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		rf.currentTerm = args.Term
 		rf.state = Follower
 		rf.votedFor = -1
-		//rf.persist()
+		rf.persist()
 	}
 
 	// follower日志长度小于leader，返回false
@@ -515,7 +520,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			}
 		}
 	}
-	//rf.persist()
+	rf.persist()
 
 	if args.LeaderCommit > rf.commitIndex {
 		rf.commitIndex = args.LeaderCommit
@@ -561,6 +566,18 @@ func (rf *Raft) persist() {
 	// e.Encode(rf.yyy)
 	// data := w.Bytes()
 	// rf.persister.SaveRaftState(data)
+
+	w := new(bytes.Buffer)
+	e := gob.NewEncoder(w)
+
+	e.Encode(rf.currentTerm)
+	e.Encode(rf.votedFor)
+	e.Encode(rf.logs)
+
+	data := w.Bytes()
+	DPrintf("RaftNode[%d] persist starts, currentTerm[%d] voteFor[%d] log[%v]", rf.me, rf.currentTerm, rf.votedFor, rf.logs)
+
+	rf.persister.SaveRaftState(data)
 }
 
 // restore previously persisted state.
@@ -568,19 +585,13 @@ func (rf *Raft) readPersist(data []byte) {
 	if data == nil || len(data) < 1 { // bootstrap without any state?
 		return
 	}
-	// Your code here (2C).
-	// Example:
-	// r := bytes.NewBuffer(data)
-	// d := labgob.NewDecoder(r)
-	// var xxx
-	// var yyy
-	// if d.Decode(&xxx) != nil ||
-	//    d.Decode(&yyy) != nil {
-	//   error...
-	// } else {
-	//   rf.xxx = xxx
-	//   rf.yyy = yyy
-	// }
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	d.Decode(&rf.currentTerm)
+	d.Decode(&rf.votedFor)
+	d.Decode(&rf.logs)
 }
 
 // CondInstallSnapshot A service wants to switch to snapshot.  Only do so if Raft hasn't
@@ -633,6 +644,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	}
 	rf.logs = append(rf.logs, &logEntry)
 	index = len(rf.logs)
+	rf.persist()
 
 	DPrintf("RaftNode[%d] Add Command, logIndex[%d] currentTerm[%d]", rf.me, index, term)
 	return index, term, isLeader
